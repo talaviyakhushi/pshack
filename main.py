@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import httpx
 import logging
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -30,8 +31,8 @@ def strip_html(html: str) -> str:
 async def update_task_note(task_id: str, note: str):
     async with httpx.AsyncClient() as client:
         url = f"{RL_BASE}/tasks/{task_id}"
-        r = await client.patch(url, headers=RL_HEADERS, json={"taskPrivateNote": note})
-        logger.info("PATCH %s → %s: %s", url, r.status_code, r.text[:500])
+        r = await client.put(url, headers=RL_HEADERS, json={"taskPrivateNote": note})
+        logger.info("PUT %s → %s: %s", url, r.status_code, r.text[:500])
         if r.status_code not in (200, 201, 204):
             logger.error("Failed to update task note: %s", r.text)
             return None
@@ -82,7 +83,7 @@ Transcript:
 
 def generate_brief(extraction: str, members: list) -> str:
     member_list = "\n".join([
-        f"- {m['firstName']} {m['lastName']} ({m.get('emailId', '')})"
+        f"- {m.get('firstName', '')} {m.get('lastName', '')} ({m.get('emailId', '')})".strip()
         for m in members
     ]) or "No project members found."
 
@@ -130,10 +131,9 @@ async def process_transcript(task_id: str, project_id: str, description: str):
     brief = generate_brief(extraction, members)
 
     note = (
-        "<h3>📋 AI Brief — Transcript Analysis</h3>"
-        f"<p><strong>Action Plan:</strong></p><p>{brief}</p>"
-        "<hr/>"
-        f"<p><strong>Extracted Requirements:</strong></p><pre>{extraction}</pre>"
+        "<h3>AI Brief - Transcript Analysis</h3>"
+        f"<p><strong>Action Plan:</strong></p><p>{html.escape(brief)}</p>"
+        f"<p><strong>Extracted Requirements:</strong></p><pre>{html.escape(extraction)}</pre>"
     )
     await update_task_note(task_id, note)
     logger.info("Task %s: brief written to private note.", task_id)
