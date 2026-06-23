@@ -230,22 +230,27 @@ async def poll_for_answers(task_id: str, questions: list, baseline_count: int, m
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
-
-    if payload.get("eventType") != "TASK_UPDATED":
-        return {"status": "ignored"}
-
-    changed_fields = payload.get("changeLog", {}).get("changedFields", [])
-    new_status = payload.get("changeLog", {}).get("to", {}).get("status", {}).get("label", "")
-
-    if "status" not in changed_fields or new_status.lower() != "done":
-        return {"status": "ignored"}
+    event_type = payload.get("eventType")
 
     task = payload.get("data", {}).get("task", {})
-    task_id = str(task.get("taskId"))
-    project_id = str(task.get("project", {}).get("projectId"))
+    task_id = str(task.get("taskId", ""))
+    project_id = str(task.get("project", {}).get("projectId", ""))
 
-    background_tasks.add_task(process_transcript, task_id, project_id)
-    return {"status": "processing"}
+    if not task_id or not project_id:
+        return {"status": "ignored"}
+
+    if event_type == "TASK_CREATED":
+        background_tasks.add_task(process_transcript, task_id, project_id)
+        return {"status": "processing"}
+
+    if event_type == "TASK_UPDATED":
+        changed_fields = payload.get("changeLog", {}).get("changedFields", [])
+        new_status = payload.get("changeLog", {}).get("to", {}).get("status", {}).get("label", "")
+        if "status" in changed_fields and new_status.lower() == "done":
+            background_tasks.add_task(process_transcript, task_id, project_id)
+            return {"status": "processing"}
+
+    return {"status": "ignored"}
 
 
 @app.get("/health")
