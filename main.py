@@ -1,8 +1,14 @@
 import os
+import re
 import httpx
-import asyncio
+import logging
 from fastapi import FastAPI, Request, BackgroundTasks
 from anthropic import Anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 claude = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -15,46 +21,31 @@ RL_HEADERS = {
 }
 
 
+def strip_html(html: str) -> str:
+    return re.sub(r"<[^>]+>", "", html).strip()
+
+
 # ── Rocketlane helpers ─────────────────────────────────────────────────────────
 
-async def get_task_attachments(task_id: str) -> list:
+async def update_task_note(task_id: str, note: str):
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{RL_BASE}/tasks/{task_id}/attachments", headers=RL_HEADERS)
-        r.raise_for_status()
-        return r.json().get("data", [])
-
-
-async def download_attachment(url: str) -> str:
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=RL_HEADERS)
-        r.raise_for_status()
-        return r.text
+        url = f"{RL_BASE}/tasks/{task_id}"
+        r = await client.patch(url, headers=RL_HEADERS, json={"taskPrivateNote": note})
+        logger.info("PATCH %s → %s: %s", url, r.status_code, r.text[:500])
+        if r.status_code not in (200, 201, 204):
+            logger.error("Failed to update task note: %s", r.text)
+            return None
+        return r.json()
 
 
 async def get_project_members(project_id: str) -> list:
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{RL_BASE}/projects/{project_id}", headers=RL_HEADERS)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("teamMembers", {}).get("members", [])
-
-
-async def post_comment(task_id: str, body: str):
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{RL_BASE}/tasks/{task_id}/comments",
-            headers=RL_HEADERS,
-            json={"body": body}
-        )
-        r.raise_for_status()
-        return r.json()
-
-
-async def get_comments(task_id: str) -> list:
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{RL_BASE}/tasks/{task_id}/comments", headers=RL_HEADERS)
-        r.raise_for_status()
-        return r.json().get("data", [])
+        url = f"{RL_BASE}/projects/{project_id}"
+        r = await client.get(url, headers=RL_HEADERS)
+        logger.info("GET %s → %s: %s", url, r.status_code, r.text[:300])
+        if r.status_code != 200:
+            return []
+        return r.json().get("teamMembers", {}).get("members", [])
 
 
 # ── Claude helpers ─────────────────────────────────────────────────────────────
@@ -89,19 +80,32 @@ Transcript:
     return message.content[0].text
 
 
-def generate_brief(requirements_and_answers: str) -> str:
+def generate_brief(extraction: str, members: list) -> str:
+    member_list = "\n".join([
+        f"- {m['firstName']} {m['lastName']} ({m.get('emailId', '')})"
+        for m in members
+    ]) or "No project members found."
+
     message = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=500,
+        max_tokens=600,
         messages=[{
             "role": "user",
-            "content": f"""You are helping an Implementation Manager prepare for their next client call.
+            "content": f"""You are helping an Implementation Manager after a client call.
 
-Based on the following requirements and expert answers, write a concise brief (3-5 sentences) the IM can use going into the next call. Be direct and actionable.
+Here are the requirements extracted from the transcript:
 
-{requirements_and_answers}
+{extraction}
 
-Brief:"""
+Project team members:
+{member_list}
+
+Write a concise action plan (3-5 sentences) for the IM:
+- What needs follow-up and from which team
+- Suggested owners from the member list above
+- What to confirm before the next client call
+
+Be direct and specific."""
         }]
     )
     return message.content[0].text
@@ -109,120 +113,30 @@ Brief:"""
 
 # ── Core pipeline ──────────────────────────────────────────────────────────────
 
-async def process_transcript(task_id: str, project_id: str):
-    # 1. Get transcript attachment
-    attachments = await get_task_attachments(task_id)
-    if not attachments:
-        await post_comment(task_id, "⚠️ No attachments found. Please upload the transcript file and mark Done again.")
+async def process_transcript(task_id: str, project_id: str, description: str):
+    transcript = strip_html(description)
+
+    if len(transcript) < 50:
+        logger.info("Task %s: description too short, skipping.", task_id)
         return
 
-    transcript_url = attachments[0].get("url")
-    transcript = await download_attachment(transcript_url)
-
-    # 2. Extract requirements via Claude
     extraction = extract_requirements(transcript)
 
     if "NO_ACTION" in extraction:
-        await post_comment(task_id, "✅ Transcript processed — no actionable requirements found in this meeting.")
+        await update_task_note(task_id, "<p>✅ Transcript processed — no actionable requirements found.</p>")
         return
 
-    # 3. Get project members
     members = await get_project_members(project_id)
-    member_list = "\n".join([
-        f"- {m['firstName']} {m['lastName']} ({m['emailId']})"
-        for m in members
-    ])
+    brief = generate_brief(extraction, members)
 
-    # 4. Ask IM to assign teammates
-    comment_body = f"""📋 **Transcript processed. Here's what I found:**
-
-{extraction}
-
----
-**Please reply telling me who handles each team type above.**
-Current project members:
-{member_list}
-
-Example reply format:
-Legal → sarah@company.com
-Engineering → ravi@company.com"""
-
-    await post_comment(task_id, comment_body)
-
-    # 5. Poll for IM's assignment reply
-    await poll_for_assignments(task_id, extraction)
-
-
-async def poll_for_assignments(task_id: str, extraction: str, max_attempts: int = 20):
-    initial_count = len(await get_comments(task_id))
-
-    for _ in range(max_attempts):
-        await asyncio.sleep(30)
-        comments = await get_comments(task_id)
-        if len(comments) > initial_count:
-            new_comment = comments[-1]["body"]
-            await handle_assignments(task_id, extraction, new_comment)
-            return
-
-    await post_comment(task_id, "⏰ Timed out waiting for assignments. Please reply and I'll continue.")
-
-
-async def handle_assignments(task_id: str, extraction: str, assignment_reply: str):
-    requirements = extraction.strip().split("---")
-    posted_questions = []
-
-    for req in requirements:
-        if "REQUIREMENT:" not in req:
-            continue
-
-        req_data = {}
-        for line in req.strip().split("\n"):
-            if line.startswith("REQUIREMENT:"):
-                req_data["requirement"] = line.replace("REQUIREMENT:", "").strip()
-            elif line.startswith("TEAM_TYPE:"):
-                req_data["team_type"] = line.replace("TEAM_TYPE:", "").strip()
-            elif line.startswith("QUESTION:"):
-                req_data["question"] = line.replace("QUESTION:", "").strip()
-
-        if not req_data:
-            continue
-
-        # Match team type to assigned email from IM's reply
-        assigned_email = None
-        for line in assignment_reply.split("\n"):
-            if req_data.get("team_type", "").lower() in line.lower() and "→" in line:
-                assigned_email = line.split("→")[-1].strip()
-                break
-
-        if assigned_email:
-            comment = f"@{assigned_email}\n\n**Re: {req_data['requirement']}**\n\n{req_data['question']}"
-        else:
-            comment = f"**{req_data['requirement']}** (Team: {req_data.get('team_type')})\n\n{req_data['question']}"
-
-        await post_comment(task_id, comment)
-        posted_questions.append(req_data)
-
-    comment_count = len(await get_comments(task_id))
-    await poll_for_answers(task_id, posted_questions, comment_count)
-
-
-async def poll_for_answers(task_id: str, questions: list, baseline_count: int, max_attempts: int = 40):
-    for _ in range(max_attempts):
-        await asyncio.sleep(30)
-        comments = await get_comments(task_id)
-        new_comments = comments[baseline_count:]
-
-        if len(new_comments) >= len(questions):
-            answers_text = "\n\n".join([
-                f"Q: {q['question']}\nA: {new_comments[i]['body']}"
-                for i, q in enumerate(questions)
-                if i < len(new_comments)
-            ])
-            brief = generate_brief(answers_text)
-            await post_comment(task_id, f"✅ **Brief ready for your next call:**\n\n{brief}")
-            return
-
-    await post_comment(task_id, "⏰ Still waiting on some answers. I'll post the brief once everyone has replied.")
+    note = (
+        "<h3>📋 AI Brief — Transcript Analysis</h3>"
+        f"<p><strong>Action Plan:</strong></p><p>{brief}</p>"
+        "<hr/>"
+        f"<p><strong>Extracted Requirements:</strong></p><pre>{extraction}</pre>"
+    )
+    await update_task_note(task_id, note)
+    logger.info("Task %s: brief written to private note.", task_id)
 
 
 # ── Webhook endpoint ───────────────────────────────────────────────────────────
@@ -235,19 +149,20 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     task = payload.get("data", {}).get("task", {})
     task_id = str(task.get("taskId", ""))
     project_id = str(task.get("project", {}).get("projectId", ""))
+    description = task.get("taskDescription", "")
 
     if not task_id or not project_id:
         return {"status": "ignored"}
 
     if event_type == "TASK_CREATED":
-        background_tasks.add_task(process_transcript, task_id, project_id)
+        background_tasks.add_task(process_transcript, task_id, project_id, description)
         return {"status": "processing"}
 
     if event_type == "TASK_UPDATED":
         changed_fields = payload.get("changeLog", {}).get("changedFields", [])
         new_status = payload.get("changeLog", {}).get("to", {}).get("status", {}).get("label", "")
         if "status" in changed_fields and new_status.lower() == "done":
-            background_tasks.add_task(process_transcript, task_id, project_id)
+            background_tasks.add_task(process_transcript, task_id, project_id, description)
             return {"status": "processing"}
 
     return {"status": "ignored"}
