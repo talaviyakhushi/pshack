@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import json
 import httpx
 import logging
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -22,8 +23,8 @@ RL_HEADERS = {
 }
 
 
-def strip_html(html: str) -> str:
-    return re.sub(r"<[^>]+>", "", html).strip()
+def strip_html(raw: str) -> str:
+    return re.sub(r"<[^>]+>", "", raw).strip()
 
 
 # ── Rocketlane helpers ─────────────────────────────────────────────────────────
@@ -32,18 +33,32 @@ async def update_task_note(task_id: str, note: str):
     async with httpx.AsyncClient() as client:
         url = f"{RL_BASE}/tasks/{task_id}"
         r = await client.put(url, headers=RL_HEADERS, json={"taskPrivateNote": note})
-        logger.info("PUT %s → %s: %s", url, r.status_code, r.text[:500])
+        logger.info("PUT %s → %s", url, r.status_code)
         if r.status_code not in (200, 201, 204):
-            logger.error("Failed to update task note: %s", r.text)
-            return None
-        return r.json()
+            logger.error("update_task_note failed: %s", r.text)
+        return r
+
+
+async def create_subtask(project_id: str, parent_task_id: str, name: str, description: str, assignee_user_id: int):
+    body = {
+        "taskName": name,
+        "project": {"projectId": int(project_id)},
+        "parent": {"taskId": int(parent_task_id)},
+        "taskDescription": description,
+        "assignees": {"members": [{"userId": assignee_user_id}]}
+    }
+    async with httpx.AsyncClient() as client:
+        url = f"{RL_BASE}/tasks"
+        r = await client.post(url, headers=RL_HEADERS, json=body)
+        logger.info("POST %s → %s: %s", url, r.status_code, r.text[:300])
+        return r
 
 
 async def get_project_members(project_id: str) -> list:
     async with httpx.AsyncClient() as client:
         url = f"{RL_BASE}/projects/{project_id}"
         r = await client.get(url, headers=RL_HEADERS)
-        logger.info("GET %s → %s: %s", url, r.status_code, r.text[:300])
+        logger.info("GET %s → %s", url, r.status_code)
         if r.status_code != 200:
             return []
         return r.json().get("teamMembers", {}).get("members", [])
@@ -81,35 +96,46 @@ Transcript:
     return message.content[0].text
 
 
-def generate_brief(extraction: str, members: list) -> str:
+def assign_to_members(extraction: str, members: list) -> list:
     member_list = "\n".join([
-        f"- {m.get('firstName', '')} {m.get('lastName', '')} ({m.get('emailId', '')})".strip()
+        f"- userId:{m.get('userId')} | {m.get('firstName', '')} {m.get('lastName', '')} | {m.get('emailId', '')}"
         for m in members
-    ]) or "No project members found."
+    ])
 
     message = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        max_tokens=1000,
         messages=[{
             "role": "user",
-            "content": f"""You are helping an Implementation Manager after a client call.
+            "content": f"""You are assigning follow-up questions to project team members.
 
-Here are the requirements extracted from the transcript:
-
+Extracted requirements:
 {extraction}
 
-Project team members:
+Team members:
 {member_list}
 
-Write a concise action plan (3-5 sentences) for the IM:
-- What needs follow-up and from which team
-- Suggested owners from the member list above
-- What to confirm before the next client call
+For each requirement block above, assign it to the most suitable team member based on their name/email.
+Avoid assigning to "Rocketlane Admin" unless no one else fits.
 
-Be direct and specific."""
+Return a JSON array ONLY, no other text:
+[
+  {{
+    "requirement": "<requirement summary>",
+    "question": "<question to ask>",
+    "team_type": "<team type>",
+    "userId": <integer userId>,
+    "memberName": "<first last>"
+  }}
+]"""
         }]
     )
-    return message.content[0].text
+    raw = message.content[0].text.strip()
+    # extract JSON array from response
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if not match:
+        return []
+    return json.loads(match.group())
 
 
 # ── Core pipeline ──────────────────────────────────────────────────────────────
@@ -124,19 +150,35 @@ async def process_transcript(task_id: str, project_id: str, description: str):
     extraction = extract_requirements(transcript)
 
     if "NO_ACTION" in extraction:
-        await update_task_note(task_id, "<p>✅ Transcript processed — no actionable requirements found.</p>")
+        await update_task_note(task_id, "<p>Transcript processed — no actionable requirements found.</p>")
         return
 
     members = await get_project_members(project_id)
-    brief = generate_brief(extraction, members)
+    if not members:
+        await update_task_note(task_id, f"<p>Requirements extracted but could not fetch project members.</p><pre>{html.escape(extraction)}</pre>")
+        return
 
-    note = (
-        "<h3>AI Brief - Transcript Analysis</h3>"
-        f"<p><strong>Action Plan:</strong></p><p>{html.escape(brief)}</p>"
-        f"<p><strong>Extracted Requirements:</strong></p><pre>{html.escape(extraction)}</pre>"
-    )
-    await update_task_note(task_id, note)
-    logger.info("Task %s: brief written to private note.", task_id)
+    assignments = assign_to_members(extraction, members)
+    if not assignments:
+        await update_task_note(task_id, f"<p>Could not parse assignments.</p><pre>{html.escape(extraction)}</pre>")
+        return
+
+    # Create one subtask per assignment
+    created = []
+    for a in assignments:
+        subtask_name = f"[AI] {a.get('team_type', 'Follow-up')}: {a.get('requirement', '')[:60]}"
+        subtask_desc = f"<p><strong>Question for {html.escape(a.get('memberName', ''))}:</strong></p><p>{html.escape(a.get('question', ''))}</p>"
+        r = await create_subtask(project_id, task_id, subtask_name, subtask_desc, a["userId"])
+        if r.status_code in (200, 201):
+            created.append(f"{a.get('memberName')} — {a.get('requirement', '')[:60]}")
+            logger.info("Subtask created for userId %s", a["userId"])
+        else:
+            logger.error("Subtask creation failed for userId %s: %s", a["userId"], r.text)
+
+    summary = "<h3>AI Follow-up Tasks Created</h3><ul>" + \
+        "".join(f"<li>{html.escape(c)}</li>" for c in created) + "</ul>"
+    await update_task_note(task_id, summary)
+    logger.info("Task %s: %d subtasks created.", task_id, len(created))
 
 
 # ── Webhook endpoint ───────────────────────────────────────────────────────────
